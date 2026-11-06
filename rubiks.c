@@ -4,20 +4,25 @@
  *  风格: Windows 95 / 扫雷式灰阶浮雕 UI, 只有魔方六个面保留彩色。
  *  视图: 真 3D 透视立方体, 可拖拽旋转视角, 转层带连续动画。
  *
- *  交互 (精简版)
- *   - 左键拖动 = 转动魔方 (贴纸上拖 = 该层, 空白处拖 = 最近的层)
+ *  交互 (v0.2 精简版)
+ *   - 左键拖动 = 跟手转动魔方: 该层实时跟随鼠标, 可停在任意中间角度;
+ *     松手才吸附到最近的 90 度。贴纸上拖 = 该层, 空白处拖 = 最近的层
  *   - 右键拖动 = 旋转视角; 上下方向按习惯反转, 左右保持; 视角不走指令通道
- *   - 窗口固定尺寸, 不可缩放 / 不可最大化
+ *   - 窗口固定竖长窄尺寸, 不可缩放 / 不可最大化
  *   - 底部只有一行: 主视角 打乱 复位 说明书 指令:[输入框] 输入
  *   - 指令通道只负责转动魔方 + reset 复位; 打乱 = 生成随机指令经同一通道播放
  *
- *  核心设计
+ *  核心设计 (v0.2: 统一转层控制器, 参考 Web 版 three.js 手势模型)
  *   - 54 张贴纸 = (位置 p, 法向 n, 颜色), 不硬编码置换表。
  *     转动 = 绕坐标轴把一层内的 (p,n) 做 90 度整数旋转再查回槽位。
- *   - 渲染: 每张贴纸是一个 3D 空间四边形, 经 [层动画旋转] -> [视角旋转]
- *     -> [透视投影] -> 背面剔除 -> 画家算法深度排序 -> GDI Polygon。
- *   - 动画技巧: 命令执行时立即更新逻辑颜色, 渲染时把该层的贴纸按
- *     -k*90° -> 0 反向插值, 于是"新的颜色从旧的位置滑到新位置"。
+ *   - 手势层: 命中测试 -> 屏幕方向投影 -> 锁定 (axis, layer, 旋转符号)。
+ *   - 控制层: Turn 统一表达三种状态, 对外只输出一个 render_angle:
+ *       T_DRAG  拖拽中 -- 逻辑未提交, 角度 = 鼠标累积角, 可停在任意中间态
+ *       T_TWEEN 松手吸附 / 指令动画 -- 逻辑已提交, 角度从 t_from 平滑回 0
+ *     松手时利用旋转可加性 rot(k, A-k*90°) == rot(0, A), 视觉零跳变。
+ *   - 渲染层: 每张贴纸是 3D 四边形, 经 [层级旋转] -> [视角旋转] ->
+ *     [透视投影] -> 背面剔除 -> 画家算法深度排序 -> GDI Polygon;
+ *     不关心角度来自拖拽还是指令。
  *   - 无第三方依赖, 仅 kernel32 / user32 / gdi32 / msvcrt, 静态链接。
  *
  *  编译 (MinGW-w64 / w64devkit):
@@ -54,6 +59,10 @@
 #define PI 3.14159265358979323846
 #endif
 #define CAM_D 8.0
+#define QT          (PI/2.0)             /* 一个 90 度 (弧度) */
+#define MAX_TURN_K  2                    /* 单次拖拽最多提交 180 度 */
+#define WIN_W       520                  /* 固定窗口: 竖长窄窗口 (宽 < 高) */
+#define WIN_H       600
 
 /* ==========================================================================
  *  第一部分: 纯逻辑 + 3D 数学 (与界面无关, 可独立自检)
@@ -152,6 +161,31 @@ static void view_drag(int dx, int dy, double *yaw, double *pitch)
     *pitch += (double)dy * 0.009;
     if (*pitch >  1.25) *pitch =  1.25;
     if (*pitch < -1.25) *pitch = -1.25;
+}
+
+/* --------------------------------------------------------------------------
+ *  转层控制器 (纯数学, GUI 与自检共用)
+ *  跟手模型: 拖拽时角度完全由鼠标位移决定, 可以停在任意中间状态;
+ *  松手时才把逻辑状态一次性提交为整数个 90 度, 并从当前角度平滑吸附。
+ * -------------------------------------------------------------------------- */
+static int snap_quarters(double ang)
+{
+    int k = (int)floor(ang / QT + 0.5);
+    if (k >  MAX_TURN_K) k =  MAX_TURN_K;
+    if (k < -MAX_TURN_K) k = -MAX_TURN_K;
+    return k;
+}
+static double drag_angle_step(double proj_px, double px_per_quarter, int sign)
+{
+    if (px_per_quarter < 1.0) px_per_quarter = 1.0;
+    return proj_px * (QT / px_per_quarter) * (double)sign;
+}
+static double clamp_drag_angle(double a)
+{
+    double lim = (MAX_TURN_K + 0.5) * QT;
+    if (a >  lim) a =  lim;
+    if (a < -lim) a = -lim;
+    return a;
 }
 
 static void init_geometry(void)
@@ -383,13 +417,23 @@ static HFONT  g_fUI, g_fSmall;
 static HDC    g_memdc; static HBITMAP g_membmp, g_oldbmp;
 static int    g_w, g_h;
 
-/* -------------------------------- 视图 / 动画 / 命令 */
+/* -------------------------------- 视图 / 统一转层控制器 / 命令 */
 static double g_yaw = -0.62, g_pitch = 0.48;
 static double g_tYaw = -0.62, g_tPitch = 0.48;
 static double g_cx, g_cy, g_scale;
 
-typedef struct { int on, axis, layer, k; DWORD t0; int dur; } Anim;
-static Anim anim;
+#define T_NONE  0
+#define T_DRAG  1
+#define T_TWEEN 2
+typedef struct {
+    int    mode, axis, layer, sign;
+    double drag_ang;          /* 拖拽累积角(弧度), 可停在任意中间态 */
+    double t_from;            /* 补间起始角 */
+    DWORD  t0; int dur;
+    double dirx, diry;        /* 拖拽方向在屏幕上的单位向量 */
+    double px_per_quarter;    /* 拖多少像素 = 90 度 */
+} Turn;
+static Turn turn;
 
 #define QCAP 64
 #define K_MOVE  0
@@ -415,13 +459,11 @@ static Btn btns[NBTN];
 #define ID_RUN   204
 #define ID_EDIT  400                       /* 输入框控件 ID */
 
-#define WIN_W     600                      /* 固定窗口外框尺寸 */
-#define WIN_H     560
 #define APP_TITLE L"CUBE95  ·  3D 魔方"
 
 static int  press_id;
 static int  drag_mode;                      /* 0 无 / 1 左键转层 / 2 右键转视角 */
-static int  drag_done, drag_idx;
+static int  drag_active, drag_idx;          /* drag_active: 已锁定转层轴 */
 static POINT drag_pt, drag_last;
 static RECT g_stage_rect, g_edit_rc, g_label_rc;
 static WCHAR g_msg[256];                   /* 短提示: 显示在标题栏, 4 秒后自动消失 */
@@ -502,10 +544,29 @@ static void enqueue(Cmd c)
 {
     if (qt - qh < QCAP) queue[qt++ % QCAP] = c;
 }
-static void start_anim(Move m, int dur)
+/* 结束可能正在播放的补间: 逻辑状态已经提交, 直接归位即可 */
+static void settle_turn(void)
 {
-    anim.on=1; anim.axis=m.axis; anim.layer=m.layer; anim.k=m.k;
-    anim.t0=GetTickCount(); anim.dur=dur;
+    if (turn.mode == T_TWEEN) turn.mode = T_NONE;
+}
+/* 指令动画: 逻辑先转 k*90, 渲染从 -k*90 反向插值回 0 */
+static void begin_tween(Move m, int dur)
+{
+    turn.mode=T_TWEEN; turn.axis=m.axis; turn.layer=m.layer;
+    turn.t_from = -(double)m.k * QT;
+    turn.t0=GetTickCount(); turn.dur=dur;
+}
+/* 渲染层唯一入口: 不关心角度来自拖拽还是指令 */
+static double turn_render_angle(void)
+{
+    if (turn.mode==T_DRAG) return turn.drag_ang;
+    if (turn.mode==T_TWEEN) {
+        double t=(double)(GetTickCount()-turn.t0)/(double)turn.dur;
+        if (t<0) t=0;
+        if (t>1) t=1;
+        return turn.t_from * (1.0 - t*t*(3.0-2.0*t));
+    }
+    return 0.0;
 }
 static void apply_cmd(Cmd c)
 {
@@ -514,7 +575,7 @@ static void apply_cmd(Cmd c)
     else                 { logic_push(m); start_clock(); }
     if (m.k == 0) return;
     rotate_layer(m.axis, m.layer, m.k);
-    start_anim(m, c.kind==K_SCRAM ? 24 : 150);
+    begin_tween(m, c.kind==K_SCRAM ? 24 : 150);
     if (is_solved() && timing==1) {
         elapsed_ms = GetTickCount() - t_start;
         timing = 2;
@@ -525,7 +586,7 @@ static void apply_cmd(Cmd c)
 }
 static void clear_queue(void)
 {
-    qh = qt = 0; anim.on = 0; scram_pending = 0;
+    qh = qt = 0; turn.mode = T_NONE; scram_pending = 0;
 }
 /* 指令通道: as_base=1 表示这是打乱生成的随机指令 */
 static void run_commands(const WCHAR *text, int as_base)
@@ -683,17 +744,10 @@ static void draw_poly(HDC dc, POINT q[4], HBRUSH br)
 static void draw_cube(HDC dc)
 {
     int i, f, a;
-    double ang = 0.0;
+    double ang = turn_render_angle();
+    int rotating = (turn.mode != T_NONE);
+    int ta = turn.axis, tl = turn.layer;
     P3 bigq[4]; POINT bp[4];
-
-    /* 动画角度: 逻辑已转 k*90, 渲染回退 -k*90*(1-ease) */
-    if (anim.on) {
-        DWORD now = GetTickCount();
-        double t = (double)(now - anim.t0) / (double)anim.dur;
-        if (t > 1) t = 1;
-        if (t < 0) t = 0;
-        ang = -(double)anim.k * (PI/2.0) * (1.0 - t*t*(3.0-2.0*t));
-    }
 
     /* 立方体本体: 三个可见大面 */
     for (f=0;f<NF;f++) {
@@ -711,9 +765,9 @@ static void draw_cube(HDC dc)
         int j;
         sticker_quad(i, q);
         n = p3v(NORM[i/9]);
-        if (anim.on && vc(slots[i].p, anim.axis) == anim.layer) {
-            for (j=0;j<4;j++) q[j] = rot_axis(q[j], anim.axis, ang);
-            n = rot_axis(n, anim.axis, ang);
+        if (rotating && vc(slots[i].p, ta) == tl) {
+            for (j=0;j<4;j++) q[j] = rot_axis(q[j], ta, ang);
+            n = rot_axis(n, ta, ang);
         }
         c = cam_rot(p3((q[0].x+q[1].x+q[2].x+q[3].x)/4.0,
                        (q[0].y+q[1].y+q[2].y+q[3].y)/4.0,
@@ -747,7 +801,7 @@ static void screen_dir(P3 center, V3 d, double *sx, double *sy)
     if (L < 0.0001) { *sx=0; *sy=0; return; }
     *sx = dx/L; *sy = dy/L;
 }
-static Move drag_to_move(int idx, int dx, int dy)
+static Move drag_to_move(int idx, int dx, int dy, double *osx, double *osy)
 {
     int f = idx/9;
     V3 n = NORM[f], u = UVEC[f], v = VVEC[f], d3, ax;
@@ -766,7 +820,44 @@ static Move drag_to_move(int idx, int dx, int dy)
     m.axis = a;
     m.k = vc(ax,a);
     m.layer = vc(slots[idx].p, a);
+    if (osx && osy) screen_dir(center, d3, osx, osy);
     return m;
+}
+
+/* 手势层 -> 控制层: 超过阈值后锁定 (轴, 层, 屏幕方向, 符号), 进入跟手拖拽 */
+static void begin_layer_drag(int idx, int dx, int dy)
+{
+    double sx=0.0, sy=0.0;
+    Move m = drag_to_move(idx, dx, dy, &sx, &sy);
+    settle_turn();
+    clear_queue();                        /* 拖拽优先于待播指令 */
+    turn.mode=T_DRAG;
+    turn.axis=m.axis; turn.layer=m.layer; turn.sign=m.k;
+    turn.dirx=sx; turn.diry=sy;
+    turn.drag_ang=0.0;
+    turn.px_per_quarter = g_scale*1.55;  /* 约一个半贴纸 = 90 度 */
+    if (turn.px_per_quarter < 24.0) turn.px_per_quarter = 24.0;
+    drag_active=1;
+}
+/* 松手: 提交逻辑状态, 再从当前角度平滑吸附到最近的 90 度 */
+static void finish_layer_drag(void)
+{
+    double A = turn.drag_ang;
+    int k = snap_quarters(A);
+    Move m; m.axis=turn.axis; m.layer=turn.layer; m.k=k;
+    if (k) {
+        logic_push(m); start_clock();
+        rotate_layer(m.axis, m.layer, m.k);
+        if (is_solved() && timing==1) {
+            elapsed_ms = GetTickCount()-t_start;
+            timing=2; set_status(L"六面复原!"); MessageBeep(MB_OK);
+        }
+        save_state();
+    }
+    turn.mode=T_TWEEN;
+    /* 旋转可加性: rot(k, A-k*90) == rot(0, A) => 松手瞬间零跳变 */
+    turn.t_from = A - (double)k*QT;
+    turn.t0=GetTickCount(); turn.dur=150;
 }
 
 /* -------------------------------- 命中测试 */
@@ -868,8 +959,8 @@ static void draw(HDC dc)
 
     /* 顶部: 扫雷式计数器 */
     {
-        int lx = (int)g_cx - 190;
-        int tx = (int)g_cx + 92;
+        int lx = (int)g_cx - 150;        /* 随窄窗口自适应居中 */
+        int tx = (int)g_cx + 34;
         SetRect(&rc,lx-52,20,lx-4,46);
         txt(dc,L"步数",rc,g_fUI,C_BLACK,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         led3(dc,lx,16,steps);
@@ -933,7 +1024,9 @@ static void resize_buffer(void)
 static void show_help(void)
 {
     MessageBoxW(g_hwnd,
-        L"【鼠标】左键拖动 = 只转动魔方：按在贴纸上拖 = 转该层；舞台空白处拖 = 转最近的层。\n"
+        L"【鼠标】左键拖动 = 跟手转层：该层实时跟随鼠标，可停在任意中间角度看清楚；\n"
+        L"        松手后自动吸附到最近的 90 度。贴纸上拖 = 该层，空白处拖 = 最近的层。\n"
+        L"        拖不满 45 度就松手会弹回原位，不计步数。\n"
         L"        右键拖动 = 只转视角；向下拖抬头、向上拖低头，左右方向不变。\n"
         L"        左键绝不会改变视角，右键绝不会转动魔方，视角不进指令通道。\n"
         L"【按钮】主视角 = 恢复默认斜视角；打乱 / 复位；说明书 = 本窗口；输入 = 执行指令。\n"
@@ -1016,7 +1109,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         int id = (msg==WM_LBUTTONDOWN) ? hit_button(x,y) : 0;
         POINT p; p.x=x; p.y=y;
         if (id) { press_id=id; SetCapture(hwnd); return 0; }
-        drag_done=0; drag_pt.x=x; drag_pt.y=y; drag_last.x=x; drag_last.y=y;
+        drag_active=0; drag_pt.x=x; drag_pt.y=y; drag_last.x=x; drag_last.y=y;
         if (msg==WM_RBUTTONDOWN) {          /* 右键: 一律转视角 */
             drag_mode=2; drag_idx=-1; SetCapture(hwnd);
         } else if (PtInRect(&g_stage_rect,p)) {
@@ -1032,13 +1125,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 
     case WM_MOUSEMOVE: {
         int x=GET_X_LPARAM(lp), y=GET_Y_LPARAM(lp);
-        if (drag_mode==1 && !drag_done) {
-            if (abs(x-drag_pt.x)+abs(y-drag_pt.y) >= 12) {
-                Cmd c; c.m=drag_to_move(drag_idx,x-drag_pt.x,y-drag_pt.y);
-                c.kind=K_MOVE; enqueue(c);
-                drag_done=1;
-                InvalidateRect(hwnd,NULL,FALSE);
+        if (drag_mode==1) {
+            if (!drag_active) {
+                /* 超过阈值才锁定轴/层, 避免单击被误判成转层 */
+                if (abs(x-drag_pt.x)+abs(y-drag_pt.y) >= 8)
+                    begin_layer_drag(drag_idx, x-drag_pt.x, y-drag_pt.y);
+            } else if (turn.mode==T_DRAG) {
+                /* 跟手: 鼠标位移在该层旋转方向上的投影 -> 连续角度。
+                   鼠标停住, 角度就停住, 画面保持中间状态。 */
+                double proj = (x-drag_last.x)*turn.dirx +
+                              (y-drag_last.y)*turn.diry;
+                turn.drag_ang = clamp_drag_angle(turn.drag_ang +
+                    drag_angle_step(proj, turn.px_per_quarter, turn.sign));
             }
+            drag_last.x=x; drag_last.y=y;
+            InvalidateRect(hwnd,NULL,FALSE);
         } else if (drag_mode==2) {
             view_drag(x-drag_last.x, y-drag_last.y, &g_tYaw, &g_tPitch);
             drag_last.x=x; drag_last.y=y;
@@ -1050,12 +1151,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     case WM_LBUTTONUP:
     case WM_RBUTTONUP:
         ReleaseCapture();
-        if (msg==WM_LBUTTONUP && press_id) {
-            POINT p; p.x=GET_X_LPARAM(lp); p.y=GET_Y_LPARAM(lp);
-            int id = press_id;
-            if (hit_button(p.x,p.y)==id) do_cmd_id(id);
+        if (msg==WM_LBUTTONUP) {
+            if (press_id) {
+                POINT p; p.x=GET_X_LPARAM(lp); p.y=GET_Y_LPARAM(lp);
+                int id = press_id;
+                if (hit_button(p.x,p.y)==id) do_cmd_id(id);
+            } else if (drag_mode==1 && drag_active && turn.mode==T_DRAG) {
+                finish_layer_drag();      /* 松手才提交 + 吸附 */
+            }
         }
-        press_id=0; drag_mode=0; drag_done=0;
+        press_id=0; drag_mode=0; drag_active=0;
         InvalidateRect(hwnd,NULL,FALSE);
         return 0;
 
@@ -1078,11 +1183,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         /* 视角平滑跟随 */
         g_yaw   += (g_tYaw-g_yaw)*0.22;
         g_pitch += (g_tPitch-g_pitch)*0.22;
-        /* 动画结束 -> 取下一条命令 */
-        if (anim.on && now-anim.t0 >= (DWORD)anim.dur) anim.on=0;
-        if (!anim.on && qh<qt) apply_cmd(queue[qh++ % QCAP]);
+        /* 补间结束 -> 取下一条命令; 跟手拖拽期间队列暂停 */
+        if (turn.mode==T_TWEEN && now-turn.t0 >= (DWORD)turn.dur) turn.mode=T_NONE;
+        if (turn.mode==T_NONE && qh<qt) apply_cmd(queue[qh++ % QCAP]);
         /* 打乱播放完成: 这 22 步记为基准, 不计入用户步数 */
-        if (scram_pending && qh==qt && !anim.on) {
+        if (scram_pending && qh==qt && turn.mode==T_NONE) {
             hist_base=hlen; scram_pending=0; save_state();
         }
         InvalidateRect(hwnd,NULL,FALSE);
@@ -1237,6 +1342,51 @@ static int run_selftest(void)
         view_drag(0,-1000,&y,&p);
         CHECK(p<-1.2499,"视角俯仰下限钳制 -1.25");
     }
+    /* ---------- 转层控制器 (v0.2 跟手拖拽) ---------- */
+    {
+        CHECK(snap_quarters(0.10)==0 && snap_quarters(0.80)==1 &&
+              snap_quarters(-0.80)==-1 && snap_quarters(1.60)==1 &&
+              snap_quarters(2.40)==2 && snap_quarters(-2.40)==-2,
+              "任意拖拽角度吸附到最近的 90 度整数倍");
+        CHECK(snap_quarters(99.0)==MAX_TURN_K &&
+              snap_quarters(-99.0)==-MAX_TURN_K,
+              "超大拖拽角度被钳制在 ±180 度");
+    }
+    {
+        /* 旋转可加性: 松手瞬间视觉必须完全连续, 不允许跳变 */
+        int good=1, a, j;
+        const V3 vs[4]={{1,0,0},{0,1,-1},{1,-1,1},{-1,0,1}};
+        const double As[5]={0.35,0.79,1.10,1.90,-1.25};
+        for (a=0;a<3;a++) for (j=0;j<4;j++) for (i=0;i<5;i++) {
+            double A=As[i]; int k=snap_quarters(A);
+            V3 lv=rot_vec(vs[j],a,k);
+            P3 after=rot_axis(p3v(lv),a,A-(double)k*QT);
+            P3 before=rot_axis(p3v(vs[j]),a,A);
+            if (fabs(after.x-before.x)>1e-9 ||
+                fabs(after.y-before.y)>1e-9 ||
+                fabs(after.z-before.z)>1e-9) good=0;
+        }
+        CHECK(good,"松手吸附零跳变: rot(k, A-k*90°) == rot(0, A)");
+    }
+    {
+        int good=1, k;
+        double A;
+        for (i=-20;i<=20;i++) {
+            A=i*0.157; k=snap_quarters(A);
+            if (fabs(A-(double)k*QT) > QT/2.0+1e-9) good=0;
+        }
+        CHECK(good,"吸附补间幅度始终不超过 45 度");
+    }
+    {
+        double st=drag_angle_step(100.0,100.0,1);
+        CHECK(fabs(st-QT)<1e-9 && drag_angle_step(100.0,100.0,-1)<0,
+              "拖拽像素位移线性映射为角度, 符号跟随旋转方向");
+        CHECK(fabs(clamp_drag_angle( 99.0)-(MAX_TURN_K+0.5)*QT)<1e-9 &&
+              fabs(clamp_drag_angle(-99.0)+(MAX_TURN_K+0.5)*QT)<1e-9,
+              "自由拖拽角度钳制在 ±225 度, 不会无限累积");
+    }
+    CHECK(WIN_W < WIN_H,"默认主窗口为竖长窄窗口 (宽 < 高)");
+
     /* ---------- 指令通道 ---------- */
     {
         int n = parse_commands(L"R U R' U' F2 M E S'", parsed, 16);
