@@ -1,0 +1,18 @@
+# WorkBuddy workspace data (session-local, never commit)
+.workbuddy/
+
+# Build artifacts and self-test binary
+rubiks_test.exe
+*.o
+*.obj
+*.a
+*.log
+*.tmp
+*.bak
+
+# Local portable toolchain (see build.bat)
+.toolchain/
+
+# OS junk
+Thumbs.db
+desktop.ini
